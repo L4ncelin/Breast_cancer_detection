@@ -1,0 +1,29 @@
+name : env_ovo_project
+
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.10
+  - ipykernel
+  - pandas
+  - numpy
+  - scikit-learn
+  - matplotlib
+  - scipy
+  - pytorch
+  - torchvision
+  - pip
+  - pip:
+    - jupyter
+    - seaborn
+    - black
+    - mne
+    - tqdm
+    - jolib
+    - xgboost
+    - colorcet
+    - tensorflow
+    - statsmodels
+    - shap
+    - bokeh
