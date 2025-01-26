@@ -13,6 +13,7 @@ dependencies:
   - scipy
   - pytorch
   - torchvision
+  - scikit-image
   - pip
   - pip:
     - jupyter
