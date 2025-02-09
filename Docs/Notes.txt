@@ -1,0 +1,7 @@
+Prepocessing:
+
+Labels : Binary image and then morphological operations to create a mask for the original images
+
+FIlters : One or a combination of filters (Median filter, Un-Sharp masking, CLAHE)
+
+Pectoral zone : K-means to creat a mask to original image
