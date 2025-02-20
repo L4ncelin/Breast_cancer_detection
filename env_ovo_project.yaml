@@ -4,7 +4,7 @@ channels:
   - conda-forge
   - defaults
 dependencies:
-  - python=3.10
+  - python
   - ipykernel
   - pandas
   - numpy
@@ -15,6 +15,7 @@ dependencies:
   - torchvision
   - scikit-image
   - opencv
+  - pillow
   - pip
   - pip:
     - jupyter
