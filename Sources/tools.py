@@ -4,12 +4,17 @@ import numpy as np
 from matplotlib.patches import Circle
 import pandas as pd
 import os
+
 from tqdm import tqdm
 from skimage import morphology
 from skimage import img_as_ubyte
+from skimage.feature import graycomatrix
+
 from concurrent.futures import ThreadPoolExecutor
 import cv2
 from sklearn.cluster import KMeans
+
+from sklearn.metrics import accuracy_score, recall_score, precision_score, f1_score, roc_auc_score, confusion_matrix
 
 
 def load_images():
@@ -156,3 +161,207 @@ def get_region_of_interest(breast_images):
         images_roi += [image_roi]
 
     return images_roi
+
+
+# --------------------------- Features Exctraction --------------------------- #
+
+def compute_features_glcm(glcm, angles_nb:int=4) -> list:
+    """Compute GLCM features (Autocorrelation, contrast, cluster prominence, entopy).
+
+    Returns:
+        list: Average feature for all angles computed in GLCM
+    """
+    autocorrelations = []
+    contrasts = []
+    cluster_prominences = []
+    entropies = []
+
+    for angle in range(angles_nb):
+
+        # Extraction de la matrice GLCM normalisée
+        P = glcm[:, :, 0, angle]  # Prend la matrice pour l'angle donné
+
+        # Indices des niveaux de gris
+        i, j = np.indices(P.shape)
+
+        # Calcul des features
+        autocorrelation = np.sum(i * j * P)
+        contrast = np.sum(P * (i - j) ** 2)
+        mean = np.sum(i * P)  # Moyenne des intensités
+        cluster_prominence = np.sum((i + j - 2 * mean) ** 4 * P)
+        entropy = -np.sum(P * np.log2(P + 1e-10))  # Ajout de 1e-10 pour éviter log(0)
+
+        autocorrelations += [autocorrelation]
+        contrasts += [contrast]
+        cluster_prominences += [cluster_prominence]
+        entropies += [entropy]
+
+    avg_autocorrelation = np.mean(autocorrelations)
+    avg_contrast = np.mean(contrasts)
+    avg_cluster_prominence = np.mean(cluster_prominences)
+    avg_entropy = np.mean(entropies)
+
+    return [avg_autocorrelation, avg_contrast, avg_cluster_prominence, avg_entropy]
+
+
+def compute_glrlm(image, max_gray_level, angles=[0, 45, 90, 135]):
+
+    def get_runs(img, angle):
+        if angle == 0:  # horizontal
+            lines = img
+        elif angle == 90:  # vertical
+            lines = img.T  
+        elif angle == 45: 
+            lines = [np.diag(img, k) for k in range(-img.shape[0]+1, img.shape[1])]
+        elif angle == 135: 
+            flipped_img = np.fliplr(img) 
+            lines = [np.diag(flipped_img, k) for k in range(-flipped_img.shape[0]+1, flipped_img.shape[1])]
+
+        runs = []
+        for line in lines:
+            if len(line) == 0:
+                continue
+            run_length = 1
+            for i in range(1, len(line)):
+                if line[i] == line[i - 1]:
+                    run_length += 1
+                else:
+                    runs.append((line[i - 1], run_length))
+                    run_length = 1
+            runs.append((line[-1], run_length))  # last run
+        return runs
+
+    # Initialisation GLRLMs
+    glrlms = {angle: np.zeros((max_gray_level, image.shape[1]), dtype=int) for angle in angles}
+
+    # Compute fo each angle
+    for angle in angles:
+        runs = get_runs(image, angle)
+        for gray_level, run_length in runs:
+            if run_length <= image.shape[1]:
+                glrlms[angle][gray_level, run_length - 1] += 1
+
+    return glrlms
+
+def compute_features_glrlm(glrlm, angles:list=[0,45,90,135]) -> list:
+    """Compute GLRLM features (Short run emphasis, Long run emphasis, Gray-level non-uniformity, Short run low gray-levvel emphasis, Logn run low gray_level emphasis).
+
+    Returns:
+        list: Average feature for all angles computed in GLRLM
+    """
+    all_SRE = []
+    all_LRE = []
+    all_GLNU = []
+    all_SRLGE = []
+    all_LRLGE = []
+
+    for angle in angles:
+
+        # Extraction de la matrice GLRLM
+        P = glrlm[angle]  # Prend la matrice pour l'angle donné
+
+        G, R = P.shape # G niveaux de gris, R longueurs des runs
+
+        # Somme totale des valeurs dans la matrice GLRLM
+        total = np.sum(P)
+
+        # Indices des niveaux de gris et longueurs des runs
+        runs = np.arange(1, R + 1)  # Longueurs de runs (1,2,3,...)
+        gray_levels = np.arange(1, G + 1)  # Niveaux de gris (1,2,3,...)
+
+        # Somme des valeurs sur les longueurs des runs et niveaux de gris
+        sum_over_runs = np.sum(P, axis=1)  # Somme pour chaque niveau de gris
+        sum_over_gray = np.sum(P, axis=0)  # Somme pour chaque longueur de run
+
+        # Calcul des features
+        SRE = np.sum(sum_over_gray / (runs ** 2)) / total  # Short Run Emphasis
+        LRE = np.sum(sum_over_gray * (runs ** 2)) / total  # Long Run Emphasis
+        GLNU = np.sum(sum_over_runs ** 2) / total  # Gray-Level Non-Uniformity
+        SRLGE = np.sum(P.T / ((runs[:, None] ** 2) * (gray_levels[None, :] ** 2))) / total  # Short Run Low Gray-Level Emphasis
+        LRLGE = np.sum(P.T * (runs[:, None] ** 2) / (gray_levels[None, :]**2)) / total  # Long Run Low Gray-Level Emphasis
+
+        all_SRE += [SRE]
+        all_LRE += [LRE]
+        all_GLNU += [GLNU]
+        all_SRLGE += [SRLGE]
+        all_LRLGE += [LRLGE]
+
+    avg_SRE = np.mean(all_SRE)
+    avg_LRE = np.mean(all_LRE)
+    avg_GLNU = np.mean(all_GLNU)
+    avg_SRLGE = np.mean(all_SRLGE)
+    avg_LRLGE = np.mean(all_LRLGE)
+
+    return [avg_SRE, avg_LRE, avg_GLNU, avg_SRLGE, avg_LRLGE]
+
+def get_features_from_images(image_roi):
+    autocorrelation = []
+    contrast = []
+    cluster_prominence = []
+    entropy = []
+
+    SRE = []
+    LRE = []
+    GLNU = []
+    SRLGE = []
+    LRLGE = []
+
+    for image in tqdm(image_roi, desc="Extracting features ..."):
+        # GLCM
+        glcm = graycomatrix(image, distances=[1], angles=[0., 0.78539816, 1.57079633, 2.35619449], levels=256, symmetric=True, normed=False)
+        avg_autocorrelation, avg_contrast, avg_cluster_prominence, avg_entropy = compute_features_glcm(glcm)
+
+        autocorrelation += [avg_autocorrelation]
+        contrast += [avg_contrast]
+        cluster_prominence += [avg_cluster_prominence]
+        entropy += [avg_entropy]
+
+        # GLRLM
+        glrlm = compute_glrlm(image, max_gray_level=256, angles=[0, 45, 90, 135])
+        avg_SRE, avg_LRE, avg_GLNU, avg_SRLGE, avg_LRLGE = compute_features_glrlm(glrlm)
+
+        SRE += [avg_SRE]
+        LRE += [avg_LRE]
+        GLNU += [avg_GLNU]
+        SRLGE += [avg_SRLGE]
+        LRLGE += [avg_LRLGE]
+
+    data = pd.DataFrame({"autocorrelation":autocorrelation, "contrast":contrast, "cluster_prominence":cluster_prominence, "entropy":entropy, "SRE":SRE, "LRE":LRE, "GLNU":GLNU, "SRLGE":SRLGE, "LRLGE":LRLGE})
+
+    return data
+
+
+# ----------------------------------- Model ---------------------------------- #
+
+def compute_classification_metrics(y_true, y_pred):
+    tn, fp, fn, tp = confusion_matrix(y_true, y_pred).ravel()
+    
+    accuracy = accuracy_score(y_true, y_pred)
+    sensitivity = recall_score(y_true, y_pred)
+    specificity = tn / (tn + fp)
+    ppv = precision_score(y_true, y_pred)
+    npv = tn / (tn + fn)
+    f1 = f1_score(y_true, y_pred)
+    auc = roc_auc_score(y_true, y_pred)
+    balanced_accuracy = (sensitivity + specificity) / 2
+
+    # Affichage des résultats
+    print(f"Accuracy: {accuracy:.2f}")
+    print(f"Sensitivity (Recall): {sensitivity:.2f}")
+    print(f"Specificity: {specificity:.2f}")
+    print(f"PPV (Precision): {ppv:.2f}")
+    print(f"NPV: {npv:.2f}")
+    print(f"F1-score: {f1:.2f}")
+    print(f"AUC: {auc:.2f}")
+    print(f"Balanced Accuracy: {balanced_accuracy:.2f}")
+
+    return {
+        "Accuracy": accuracy,
+        "Sensitivity (Recall)": sensitivity,
+        "Specificity": specificity,
+        "PPV (Precision)": ppv,
+        "NPV": npv,
+        "F1-score": f1,
+        "AUC": auc,
+        "Balanced Accuracy": balanced_accuracy
+    }
