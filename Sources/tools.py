@@ -9,12 +9,19 @@ from tqdm import tqdm
 from skimage import morphology
 from skimage import img_as_ubyte
 from skimage.feature import graycomatrix
+from scipy.ndimage import median_filter
+from skimage.filters import unsharp_mask
 
 from concurrent.futures import ThreadPoolExecutor
 import cv2
 from sklearn.cluster import KMeans
 
 from sklearn.metrics import accuracy_score, recall_score, precision_score, f1_score, roc_auc_score, confusion_matrix
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.model_selection import LeaveOneOut
+
+import optuna
+from sklearn.model_selection import train_test_split
 
 
 def load_images():
@@ -155,7 +162,7 @@ def get_region_of_interest(breast_images):
 
         enhanced_image, pectoral_mask = get_pectoral_mask(image)
 
-        image_roi = enhanced_image.copy()
+        image_roi = image.copy()
         image_roi[(pectoral_mask == 2) | (pectoral_mask == 1)] = 0
 
         images_roi += [image_roi]
@@ -307,8 +314,15 @@ def get_features_from_images(image_roi):
     LRLGE = []
 
     for image in tqdm(image_roi, desc="Extracting features ..."):
+        float_flag = False
         # GLCM
-        glcm = graycomatrix(image, distances=[1], angles=[0., 0.78539816, 1.57079633, 2.35619449], levels=256, symmetric=True, normed=False)
+        try:
+            glcm = graycomatrix(image, distances=[1], angles=[0., 0.78539816, 1.57079633, 2.35619449], levels=256, symmetric=True, normed=False)
+        except ValueError:
+            float_flag = True
+            image_255 = (image * 255).astype(np.uint8)
+            glcm = graycomatrix(image_255, distances=[1], angles=[0., 0.78539816, 1.57079633, 2.35619449], levels=256, symmetric=True, normed=False)
+
         avg_autocorrelation, avg_contrast, avg_cluster_prominence, avg_entropy = compute_features_glcm(glcm)
 
         autocorrelation += [avg_autocorrelation]
@@ -317,7 +331,10 @@ def get_features_from_images(image_roi):
         entropy += [avg_entropy]
 
         # GLRLM
-        glrlm = compute_glrlm(image, max_gray_level=256, angles=[0, 45, 90, 135])
+        if float_flag == True:
+            glrlm = compute_glrlm(image_255, max_gray_level=256, angles=[0, 45, 90, 135])
+        else:
+            glrlm = compute_glrlm(image, max_gray_level=256, angles=[0, 45, 90, 135])
         avg_SRE, avg_LRE, avg_GLNU, avg_SRLGE, avg_LRLGE = compute_features_glrlm(glrlm)
 
         SRE += [avg_SRE]
@@ -330,12 +347,32 @@ def get_features_from_images(image_roi):
 
     return data
 
+# ---------------------------------- Filter ---------------------------------- #
+def apply_MF_and_CLAHE_and_USM_on_all_images(images_roi):
+    filtered_images = []
+
+    for image in tqdm(images_roi, desc="Applying MF & CLAHE & USM..."):
+        # MF
+        mf_image = median_filter(image, size=5)
+
+        # CLAHE
+        clahe = cv2.createCLAHE(clipLimit=10.0, tileGridSize=(8, 8))
+        clahe_image = clahe.apply(mf_image)
+
+        # USM
+        filtered_image = unsharp_mask(clahe_image, radius=2, amount=2)
+
+        filtered_images += [filtered_image]
+
+    return filtered_images
+
 
 # ----------------------------------- Model ---------------------------------- #
 
-def compute_classification_metrics(y_true, y_pred):
+def compute_classification_metrics(y_true, y_pred, verbose:bool=True):
+
     tn, fp, fn, tp = confusion_matrix(y_true, y_pred).ravel()
-    
+
     accuracy = accuracy_score(y_true, y_pred)
     sensitivity = recall_score(y_true, y_pred)
     specificity = tn / (tn + fp)
@@ -345,23 +382,61 @@ def compute_classification_metrics(y_true, y_pred):
     auc = roc_auc_score(y_true, y_pred)
     balanced_accuracy = (sensitivity + specificity) / 2
 
-    # Affichage des résultats
-    print(f"Accuracy: {accuracy:.2f}")
-    print(f"Sensitivity (Recall): {sensitivity:.2f}")
-    print(f"Specificity: {specificity:.2f}")
-    print(f"PPV (Precision): {ppv:.2f}")
-    print(f"NPV: {npv:.2f}")
-    print(f"F1-score: {f1:.2f}")
-    print(f"AUC: {auc:.2f}")
-    print(f"Balanced Accuracy: {balanced_accuracy:.2f}")
+    if verbose:
+        # Affichage des résultats
+        print(f"Accuracy: {accuracy:.3f}")
+        print(f"Sensitivity (Recall): {sensitivity:.3f}")
+        print(f"Specificity: {specificity:.3f}")
+        print(f"PPV (Precision): {ppv:.3f}")
+        print(f"NPV: {npv:.3f}")
+        print(f"F1-score: {f1:.3f}")
+        print(f"AUC: {auc:.3f}")
+        print(f"Balanced Accuracy: {balanced_accuracy:.3f}")
 
     return {
         "Accuracy": accuracy,
-        "Sensitivity (Recall)": sensitivity,
+        "Sensitivity": sensitivity,
         "Specificity": specificity,
-        "PPV (Precision)": ppv,
+        "PPV": ppv,
         "NPV": npv,
         "F1-score": f1,
         "AUC": auc,
         "Balanced Accuracy": balanced_accuracy
     }
+
+
+def objective(trial, X, y):
+    loo = LeaveOneOut()
+    accuracies = []
+
+    n_estimators = trial.suggest_int("n_estimators", 10, 200, step=10)
+    max_depth = trial.suggest_int("max_depth", 2, 20, step=1)
+    min_samples_split = trial.suggest_int("min_samples_split", 2, 10)
+    min_samples_leaf = trial.suggest_int("min_samples_leaf", 1, 5)
+    max_features = trial.suggest_categorical("max_features", ["sqrt", "log2", None])
+
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.3, random_state=42)
+
+    model = RandomForestClassifier(
+        random_state=42,
+        n_estimators=n_estimators,
+        max_depth=max_depth,
+        min_samples_split=min_samples_split,
+        min_samples_leaf=min_samples_leaf,
+        max_features=max_features
+    )
+    model.fit(X_train, y_train)
+
+    y_pred = model.predict(X_test)
+    accuracies.append(accuracy_score(y_test, y_pred))
+
+    return np.mean(accuracies)
+
+def get_best_hyperparameters_optuna(X, y, n_trials=20):
+    study = optuna.create_study(direction="maximize")
+    study.optimize(lambda trial: objective(trial, X, y), n_trials=n_trials)
+
+    print(f"\nMeilleurs hyperparamètres trouvés : {study.best_params}")
+    print(f"Meilleure accuracy (LOO) : {study.best_value:.4f}")
+
+    return study.best_params
