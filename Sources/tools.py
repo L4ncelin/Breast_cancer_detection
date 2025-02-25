@@ -348,6 +348,18 @@ def get_features_from_images(image_roi):
     return data
 
 # ---------------------------------- Filter ---------------------------------- #
+
+def apply_clahe_filter_on_all_images(images_roi):
+    filtered_images = []
+
+    for image in tqdm(images_roi, desc="Applying CLAHE filter..."):
+        clahe = cv2.createCLAHE(clipLimit=10.0, tileGridSize=(8, 8))
+        filtered_image = clahe.apply(image)
+
+        filtered_images += [filtered_image]
+
+    return filtered_images
+
 def apply_MF_and_CLAHE_and_USM_on_all_images(images_roi):
     filtered_images = []
 
