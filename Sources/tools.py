@@ -1,30 +1,35 @@
-from PIL import Image
-import matplotlib.pyplot as plt
-import numpy as np
-from matplotlib.patches import Circle
-import pandas as pd
+# Standard libraries
 import os
-
+import pandas as pd
+import numpy as np
+from concurrent.futures import ThreadPoolExecutor
 from tqdm import tqdm
+
+# Image processing libraries
+from PIL import Image
+import cv2
 from skimage import morphology
 from skimage import img_as_ubyte
 from skimage.feature import graycomatrix
-from scipy.ndimage import median_filter
 from skimage.filters import unsharp_mask
+from scipy.ndimage import median_filter
 
-from concurrent.futures import ThreadPoolExecutor
-import cv2
+# Machine learning libraries
 from sklearn.cluster import KMeans
-
-from sklearn.metrics import accuracy_score, recall_score, precision_score, f1_score, roc_auc_score, confusion_matrix
 from sklearn.ensemble import RandomForestClassifier
-from sklearn.model_selection import LeaveOneOut
-
-import optuna
 from sklearn.model_selection import train_test_split
+from sklearn.metrics import accuracy_score, recall_score, precision_score, f1_score, roc_auc_score, confusion_matrix
+
+# Optimization libraries
+import optuna
 
 
-def load_images():
+def load_images() -> list:
+    """Load images from the Data folder.
+
+    Returns:
+        list: All breast images
+    """
     # The folder path where images are stored
     folder_path = 'Data/all-mias/'
 
@@ -40,7 +45,12 @@ def load_images():
 
     return breast_images
 
-def load_infos():
+def load_infos() -> pd.DataFrame:
+    """Load all information about mammography, such as abnormality types, etc.
+
+    Returns:
+        pd.DataFrame: Information dataframe
+    """
     infos_df = pd.read_csv("Data/breasts_infos.txt", sep='\s+', names=["image_idx", "tissue", "abnormality", "severity", "x_coord", "y_coord", "radius"])
 
     infos_df = infos_df.fillna(0) # Fill NaN
@@ -50,8 +60,9 @@ def load_infos():
     return infos_df
 
 
-def remove_label(image):    
-
+def remove_label(image):
+    """Remove the label present in each image to isolate the breast.
+    """    
     thresh = 20  # Seuil entre 0 et 255, ajustez selon vos besoins
     binary_image = image.point(lambda p: 255 if p > thresh else 0)
 
@@ -86,39 +97,45 @@ def process_image(image):
     return remove_label(image)
 
 def get_preprocess_images(breast_images:list=[], save:bool=False) -> list:
+    """Apply the removing process on all images, in parallel.
 
-    # Parallélisation
+    Args:
+        breast_images (list, optional): PIL Images. Defaults to [].
+        save (bool, optional): Whether to save the list of images at the end of the function. Defaults to False.
+
+    Returns:
+        list: All images with labels removed
+    """
+    # Parallelisation
     with ThreadPoolExecutor(max_workers=6) as executor:
-        # Map des images avec la fonction `remove_label` tout en préservant l'ordre
         results = list(tqdm(executor.map(process_image, breast_images), total=len(breast_images)))
 
     if save :
-        # Conserver les résultats dans un fichier .npy
+        # Save file in .npy
         np.save('preprocess_images.npy', results)
 
     return results
 
 # ------------------------------------ ROI ----------------------------------- #
 
-# Fonction pour trouver le label dominant parmi les 100 premiers points du haut de l'image
 def dominant_label_top(cluster_labels, white_pixel_coords):
     """
-    Trouve le label dominant parmi les 10 premiers pixels du haut de l'image.
+    Find the dominant label between the first 10 pixels at the top of the image.
     
     Parameters:
-        cluster_labels (array): Les labels de chaque pixel blanc.
-        white_pixel_coords (array): Coordonnées (y, x) des pixels blancs.
+        cluster_labels (array): Labels for white pixels.
+        white_pixel_coords (array): Coordinnates (y, x) for white pixels.
     
     Returns:
-        int or None: Le label dominant en fonction du nombre d'occurrences.
+        int or None: Dominant label.
     """
-    top_indices = np.argsort(white_pixel_coords[:, 0])[:100]  # Prendre les 100 premiers en hauteur
+    top_indices = np.argsort(white_pixel_coords[:, 0])[:100] 
     top_labels = cluster_labels[top_indices]
     
     unique_labels, counts = np.unique(top_labels, return_counts=True)
     
     if len(unique_labels) == 0:
-        return None  # Aucun label valide
+        return None  # No label valid
     
     dominant_label = unique_labels[np.argmax(counts)]
     
@@ -126,28 +143,34 @@ def dominant_label_top(cluster_labels, white_pixel_coords):
 
 
 def get_pectoral_mask(image):
+    """Getting the pectoral muscle mask to further remove it and extract the Region Of Interest.
+
+    Args:
+        image (PIL): Original image
+
+    Returns:
+        PIL image, np.array : Enhanced image, mask of the pectoral region
+    """
     n, d = image.shape
-    # ---------------------------------- Amélioration du contraste --------------------------------- #
+    # ---------------------------------- Increase contrast quality --------------------------------- #
     clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
     enhanced_image = clahe.apply(image)
     enhanced_image = np.reshape(enhanced_image, (n,d))
 
-    # ---------------------------------- Filtrer les pixels blancs --------------------------------- #
-    # Récupérer les coordonnées et intensités des pixels blancs (seuil passé)
-    white_pixel_coords = np.column_stack(np.where(enhanced_image > 180))  # Coordonnées (y, x)
+    # ---------------------------------- Filter white pixels --------------------------------- #
+    white_pixel_coords = np.column_stack(np.where(enhanced_image > 180))
 
-    # ---------------------------------- Appliquer KMeans --------------------------------- #
-    # Appliquer KMeans sur les pixels blancs (par exemple, 3 clusters)
-    n_clusters = 2
+    # ---------------------------------- Apply KMeans --------------------------------- #
+    n_clusters = 2 # 2 cluster that are the breast and the pectoral muscle
     kmeans = KMeans(n_clusters=n_clusters, random_state=0)
     kmeans.fit(white_pixel_coords)
 
-    # Labels des clusters pour les pixels blancs
+    # Labels 
     cluster_labels = kmeans.labels_
 
-    # ---------------------------------- Créer une image des clusters --------------------------------- #
-    cluster_image = np.zeros_like(image)  # Image vide (même taille que l'originale)
-    cluster_image[white_pixel_coords[:, 0], white_pixel_coords[:, 1]] = cluster_labels + 1  # + 1 pour éviter le 0
+    # ---------------------------------- Create an image of clusters --------------------------------- #
+    cluster_image = np.zeros_like(image) 
+    cluster_image[white_pixel_coords[:, 0], white_pixel_coords[:, 1]] = cluster_labels + 1  # + 1 to pass the 0
 
     dom_label = dominant_label_top(cluster_labels, white_pixel_coords)
 
@@ -155,7 +178,15 @@ def get_pectoral_mask(image):
 
     return enhanced_image, pectoral_mask
 
-def get_region_of_interest(breast_images):
+def get_region_of_interest(breast_images) -> list:
+    """Getting all images without the pectoral muscle.
+
+    Args:
+        breast_images (list): list of original PIL images
+
+    Returns:
+        list: All mages without the pectoral mask
+    """
     images_roi = []
     for i in tqdm(range(len(breast_images)), desc="Removing Pectoral Muscle"):
         image = breast_images[i]
@@ -185,18 +216,18 @@ def compute_features_glcm(glcm, angles_nb:int=4) -> list:
 
     for angle in range(angles_nb):
 
-        # Extraction de la matrice GLCM normalisée
-        P = glcm[:, :, 0, angle]  # Prend la matrice pour l'angle donné
+        # Extracting GLCM
+        P = glcm[:, :, 0, angle]
 
-        # Indices des niveaux de gris
+        # Indices of gray level
         i, j = np.indices(P.shape)
 
-        # Calcul des features
+        # Compute features
         autocorrelation = np.sum(i * j * P)
         contrast = np.sum(P * (i - j) ** 2)
-        mean = np.sum(i * P)  # Moyenne des intensités
+        mean = np.sum(i * P) 
         cluster_prominence = np.sum((i + j - 2 * mean) ** 4 * P)
-        entropy = -np.sum(P * np.log2(P + 1e-10))  # Ajout de 1e-10 pour éviter log(0)
+        entropy = -np.sum(P * np.log2(P + 1e-10))
 
         autocorrelations += [autocorrelation]
         contrasts += [contrast]
@@ -211,8 +242,12 @@ def compute_features_glcm(glcm, angles_nb:int=4) -> list:
     return [avg_autocorrelation, avg_contrast, avg_cluster_prominence, avg_entropy]
 
 
-def compute_glrlm(image, max_gray_level, angles=[0, 45, 90, 135]):
+def compute_glrlm(image, max_gray_level, angles=[0, 45, 90, 135]) -> dict:
+    """Compute GLRLM Matrix.
 
+    Returns:
+        dict: GLRLM matrices for each angles
+    """
     def get_runs(img, angle):
         if angle == 0:  # horizontal
             lines = img
@@ -264,23 +299,21 @@ def compute_features_glrlm(glrlm, angles:list=[0,45,90,135]) -> list:
 
     for angle in angles:
 
-        # Extraction de la matrice GLRLM
-        P = glrlm[angle]  # Prend la matrice pour l'angle donné
+        # Extracting GLRLM
+        P = glrlm[angle]  # Matrix for one angle
 
-        G, R = P.shape # G niveaux de gris, R longueurs des runs
+        G, R = P.shape # G gray level, R run length
 
-        # Somme totale des valeurs dans la matrice GLRLM
         total = np.sum(P)
 
-        # Indices des niveaux de gris et longueurs des runs
-        runs = np.arange(1, R + 1)  # Longueurs de runs (1,2,3,...)
-        gray_levels = np.arange(1, G + 1)  # Niveaux de gris (1,2,3,...)
+        runs = np.arange(1, R + 1)
+        gray_levels = np.arange(1, G + 1)
 
-        # Somme des valeurs sur les longueurs des runs et niveaux de gris
-        sum_over_runs = np.sum(P, axis=1)  # Somme pour chaque niveau de gris
-        sum_over_gray = np.sum(P, axis=0)  # Somme pour chaque longueur de run
 
-        # Calcul des features
+        sum_over_runs = np.sum(P, axis=1)
+        sum_over_gray = np.sum(P, axis=0) 
+
+        # Compute features
         SRE = np.sum(sum_over_gray / (runs ** 2)) / total  # Short Run Emphasis
         LRE = np.sum(sum_over_gray * (runs ** 2)) / total  # Long Run Emphasis
         GLNU = np.sum(sum_over_runs ** 2) / total  # Gray-Level Non-Uniformity
@@ -301,7 +334,15 @@ def compute_features_glrlm(glrlm, angles:list=[0,45,90,135]) -> list:
 
     return [avg_SRE, avg_LRE, avg_GLNU, avg_SRLGE, avg_LRLGE]
 
-def get_features_from_images(image_roi):
+def get_features_from_images(image_roi:list) -> pd.DataFrame:
+    """Compute all 9 features from GLCM and GLRLM on all images.
+
+    Args:
+        image_roi (list): All PIL preprocess images
+
+    Returns:
+        pd.DataFrame: Dataframe of 9 features for each image
+    """
     autocorrelation = []
     contrast = []
     cluster_prominence = []
@@ -349,7 +390,15 @@ def get_features_from_images(image_roi):
 
 # ---------------------------------- Filter ---------------------------------- #
 
-def apply_clahe_filter_on_all_images(images_roi):
+def apply_clahe_filter_on_all_images(images_roi:list) -> list:
+    """Apply Contrast Limited Adaptive Histogram Equalization (CLAHE) filter on all images.
+
+    Args:
+        images_roi (list): All original PIL images
+
+    Returns:
+        list: All images with CLAHE Filter applied
+    """
     filtered_images = []
 
     for image in tqdm(images_roi, desc="Applying CLAHE filter..."):
@@ -360,7 +409,15 @@ def apply_clahe_filter_on_all_images(images_roi):
 
     return filtered_images
 
-def apply_MF_and_CLAHE_and_USM_on_all_images(images_roi):
+def apply_MF_and_CLAHE_and_USM_on_all_images(images_roi:list) -> list:
+    """Apply the combination of Median Filter, CLAHE filter and UnSharp Maksing on all images.
+
+    Args:
+        images_roi (list): All original PIL images
+
+    Returns:
+        list: All images with MF&CLAHE&USM Filter applied
+    """
     filtered_images = []
 
     for image in tqdm(images_roi, desc="Applying MF & CLAHE & USM..."):
@@ -378,11 +435,19 @@ def apply_MF_and_CLAHE_and_USM_on_all_images(images_roi):
 
     return filtered_images
 
-
 # ----------------------------------- Model ---------------------------------- #
 
-def compute_classification_metrics(y_true, y_pred, verbose:bool=True):
+def compute_classification_metrics(y_true, y_pred, verbose:bool=True) -> dict:
+    """Compute the performance metrics for a prediction and its true value.
 
+    Args:
+        y_true (pd.Series): Real value
+        y_pred (pd.Series): Prediction from the model
+        verbose (bool, optional): Print results or not. Defaults to True.
+
+    Returns:
+        dict: _description_
+    """
     tn, fp, fn, tp = confusion_matrix(y_true, y_pred).ravel()
 
     accuracy = accuracy_score(y_true, y_pred)
@@ -395,7 +460,7 @@ def compute_classification_metrics(y_true, y_pred, verbose:bool=True):
     balanced_accuracy = (sensitivity + specificity) / 2
 
     if verbose:
-        # Affichage des résultats
+        # Prin Results
         print(f"Accuracy: {accuracy:.3f}")
         print(f"Sensitivity (Recall): {sensitivity:.3f}")
         print(f"Specificity: {specificity:.3f}")
@@ -418,9 +483,16 @@ def compute_classification_metrics(y_true, y_pred, verbose:bool=True):
 
 
 def objective(trial, X, y):
-    loo = LeaveOneOut()
-    accuracies = []
+    """Objective function for Optuna optimization on Random Forest.
 
+    Args:
+        trial : One trial of a model
+        X (pd.DataFrame): Features data
+        y (pd.Series): Target value
+
+    Returns:
+        float: Accuracy score of the given model 
+    """
     n_estimators = trial.suggest_int("n_estimators", 10, 200, step=10)
     max_depth = trial.suggest_int("max_depth", 2, 20, step=1)
     min_samples_split = trial.suggest_int("min_samples_split", 2, 10)
@@ -440,11 +512,21 @@ def objective(trial, X, y):
     model.fit(X_train, y_train)
 
     y_pred = model.predict(X_test)
-    accuracies.append(accuracy_score(y_test, y_pred))
+    accuracy = accuracy_score(y_test, y_pred)
 
-    return np.mean(accuracies)
+    return accuracy
 
-def get_best_hyperparameters_optuna(X, y, n_trials=20):
+def get_best_hyperparameters_optuna(X, y, n_trials:int=20) -> dict:
+    """Create an Optuna study to find the best hyperparameters of a given model.
+
+    Args:
+        X (pd.DataFrame): Features data
+        y (pd.Series): Target value
+        n_trials (int, optional): Number of trial to try. Defaults to 20.
+
+    Returns:
+        dict: Best hyperparameters
+    """
     study = optuna.create_study(direction="maximize")
     study.optimize(lambda trial: objective(trial, X, y), n_trials=n_trials)
 
